@@ -164,5 +164,4 @@ python manage_clients.py remove compromised-device
 ## Need More Details?
 
 - **Security Architecture:** See [SECURITY.md](SECURITY.md)
-- **Full Auth Documentation:** See [AUTH.md](AUTH.md)
 - **Complete README:** See [README.md](README.md)

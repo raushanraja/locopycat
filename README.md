@@ -33,7 +33,7 @@ A FastAPI server with WebSocket support that broadcasts received text to connect
 3. **Shared Secret**: Derive shared secret using SHA256
 4. **Secure Communication**: All messages encrypted with shared secret
 
-See [AUTH.md](AUTH.md) for detailed authentication documentation.
+See [SECURITY.md](SECURITY.md) for detailed security documentation.
 
 ## Setup
 
