@@ -161,6 +161,20 @@ python manage_clients.py remove compromised-device
 - ✅ No plaintext transmission
 - ✅ HMAC message integrity
 
+## Configuration
+
+Customize behavior using environment variables:
+
+```bash
+# Create configuration file
+cp .env.example .env
+
+# Edit settings
+nano .env
+```
+
+See [CONFIG.md](CONFIG.md) for all configuration options.
+
 ## Need More Details?
 
 - **Security Architecture:** See [SECURITY.md](SECURITY.md)

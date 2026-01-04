@@ -2,7 +2,7 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPExcept
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from typing import List
+from typing import List, Dict
 import json
 import os
 from cryptography.hazmat.primitives import hashes, serialization
@@ -12,14 +12,27 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 import base64
 import hashlib
 import secrets
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Configuration from environment variables with defaults
+AUTHORIZED_CLIENTS_FILE = os.getenv("AUTHORIZED_CLIENTS_FILE", "authorized_clients.txt")
+SERVER_PRIVATE_KEY = os.getenv("SERVER_PRIVATE_KEY", "server_private.pem")
+SERVER_PUBLIC_KEY = os.getenv("SERVER_PUBLIC_KEY", "server_public.pem")
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", "8000"))
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+CONNECTION_TIMEOUT = int(os.getenv("CONNECTION_TIMEOUT", "30"))
 
 app = FastAPI()
 
 # Generate RSA key pair for server
 def generate_server_keys():
     """Generate or load server RSA key pair."""
-    private_key_path = "server_private.pem"
-    public_key_path = "server_public.pem"
+    private_key_path = SERVER_PRIVATE_KEY
+    public_key_path = SERVER_PUBLIC_KEY
     
     # Check if keys already exist
     if os.path.exists(private_key_path) and os.path.exists(public_key_path):
@@ -65,32 +78,60 @@ def generate_server_keys():
 # Initialize server keys
 server_private_key, server_public_key = generate_server_keys()
 
-# Authorization configuration
-AUTHORIZED_CLIENTS_FILE = "authorized_clients.txt"
-
-
-def load_authorized_clients():
-    """Load authorized client public keys from file."""
+def load_authorized_clients() -> Dict[str, str]:
+    """Load authorized client public keys from file.
+    
+    Returns dict mapping fingerprint to client_id.
+    """
     authorized_keys = {}
     if os.path.exists(AUTHORIZED_CLIENTS_FILE):
         with open(AUTHORIZED_CLIENTS_FILE, 'r') as f:
-            for line in f:
+            content = f.read().strip()
+            for line in content.split('\n'):
                 line = line.strip()
-                if line and not line.startswith('#'):
+                if not line or line.startswith('#'):
+                    continue
+                
+                # Check if this is the new format (base64 with ::)
+                if '::' in line:
+                    parts = line.split('::', 1)
+                    if len(parts) == 2:
+                        client_id, encoded_key = parts
+                        try:
+                            public_key_pem = base64.b64decode(encoded_key).decode()
+                            # Generate fingerprint from public key
+                            public_key = serialization.load_pem_public_key(
+                                public_key_pem.encode(),
+                                backend=default_backend()
+                            )
+                            public_key_bytes = public_key.public_bytes(
+                                encoding=serialization.Encoding.DER,
+                                format=serialization.PublicFormat.SubjectPublicKeyInfo
+                            )
+                            fingerprint = hashlib.sha256(public_key_bytes).hexdigest()[:16]
+                            authorized_keys[fingerprint] = client_id
+                        except Exception as e:
+                            print(f"Warning: Failed to load key for {client_id}: {e}")
+                # Old format (single line with :)
+                elif ':' in line:
                     parts = line.split(':', 1)
                     if len(parts) == 2:
                         client_id, public_key_pem = parts
-                        # Generate fingerprint from public key
-                        public_key = serialization.load_pem_public_key(
-                            public_key_pem.encode(),
-                            backend=default_backend()
-                        )
-                        public_key_bytes = public_key.public_bytes(
-                            encoding=serialization.Encoding.DER,
-                            format=serialization.PublicFormat.SubjectPublicKeyInfo
-                        )
-                        fingerprint = hashlib.sha256(public_key_bytes).hexdigest()[:16]
-                        authorized_keys[fingerprint] = client_id
+                        # Replace literal \n with actual newlines
+                        public_key_pem = public_key_pem.replace('\\n', '\n')
+                        try:
+                            public_key = serialization.load_pem_public_key(
+                                public_key_pem.encode(),
+                                backend=default_backend()
+                            )
+                            public_key_bytes = public_key.public_bytes(
+                                encoding=serialization.Encoding.DER,
+                                format=serialization.PublicFormat.SubjectPublicKeyInfo
+                            )
+                            fingerprint = hashlib.sha256(public_key_bytes).hexdigest()[:16]
+                            authorized_keys[fingerprint] = client_id
+                        except Exception as e:
+                            print(f"Warning: Failed to load key for {client_id}: {e}")
     return authorized_keys
 
 
@@ -128,7 +169,6 @@ class ConnectionManager:
         self.client_public_keys: dict = {}  # client_id -> public_key
     
     async def connect(self, websocket: WebSocket, client_id: str, shared_secret: bytes):
-        await websocket.accept()
         self.active_connections.append((websocket, shared_secret))
         print(f"Client {client_id} connected")
     
@@ -174,26 +214,6 @@ class ConnectionManager:
 def cycle_key(key: bytes, length: int) -> bytes:
     """Cycle the key to match required length."""
     return (key * ((length // len(key)) + 1))[:length]
-
-# Track active WebSocket connections
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: List[WebSocket] = []
-    
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
-    
-    def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
-    
-    async def broadcast(self, message: dict):
-        for connection in self.active_connections:
-            try:
-                await connection.send_json(message)
-            except:
-                # Remove broken connections
-                self.active_connections.remove(connection)
 
 manager = ConnectionManager()
 
@@ -246,9 +266,18 @@ async def websocket_endpoint(websocket: WebSocket):
     client_id = None
     shared_secret = None
     
+    # Accept the WebSocket connection first
+    await websocket.accept()
+    
     try:
         # Step 1: Receive client's public key
-        init_message = await websocket.receive_json()
+        try:
+            init_message = await websocket.receive_json()
+        except Exception as e:
+            await websocket.close(code=4008, reason="Invalid initial message")
+            print(f"Connection rejected: Failed to receive initial message: {e}")
+            return
+        
         client_id = init_message.get("client_id", "unknown")
         client_public_key_pem = init_message.get("public_key")
         
@@ -296,9 +325,9 @@ async def websocket_endpoint(websocket: WebSocket):
             padding.OAEP(
                 mgf=padding.MGF1(algorithm=hashes.SHA256()),
                 algorithm=hashes.SHA256(),
-                label=None
+                    label=None
+                )
             )
-        )
         
         await websocket.send_json({
             "encrypted_secret": base64.b64encode(encrypted_secret).decode()
@@ -314,11 +343,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 padding.OAEP(
                     mgf=padding.MGF1(algorithm=hashes.SHA256()),
                     algorithm=hashes.SHA256(),
-                    label=None
-                )
+                label=None
             )
+        )
         except Exception as e:
             await websocket.close(code=4008, reason="Authentication failed")
+            print(f"Error decrypting client secret: {e}")
             return
         
         # Step 5: Derive shared secret from both secrets
@@ -335,10 +365,13 @@ async def websocket_endpoint(websocket: WebSocket):
         # Connect authenticated client
         await manager.connect(websocket, client_id, shared_secret)
         
-        # Main loop
+        # Main loop - receive and respond to keepalive pings
         while True:
-            # Keep connection alive
-            await websocket.receive_text()
+            try:
+                message = await websocket.receive_text()
+                # Client should send ping messages periodically
+            except WebSocketDisconnect:
+                raise
             
     except WebSocketDisconnect:
         manager.disconnect(websocket)
@@ -348,6 +381,8 @@ async def websocket_endpoint(websocket: WebSocket):
         manager.disconnect(websocket)
     except Exception as e:
         print(f"Client {client_id} connection error: {e}")
+        import traceback
+        traceback.print_exc()
         manager.disconnect(websocket)
 
 

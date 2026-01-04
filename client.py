@@ -175,7 +175,7 @@ async def clipboard_client():
     
     # Generate client keys
     client_private_key, client_public_key = generate_client_keys()
-    client_id = f"client_{secrets.token_hex(8)}"
+    client_id = f"client-{secrets.token_hex(8)}"
     
     while retry_count < max_reconnect_attempts or max_reconnect_attempts == -1:
         try:
@@ -191,10 +191,10 @@ async def clipboard_client():
                 encoding=serialization.Encoding.PEM,
                 format=serialization.PublicFormat.SubjectPublicKeyInfo
             )
-            await websocket.send_json({
+            await websocket.send(json.dumps({
                 "client_id": client_id,
                 "public_key": client_public_key_pem.decode()
-            })
+            }))
             print("Initiating authentication...")
             
             # Step 2: Receive server public key
@@ -230,9 +230,9 @@ async def clipboard_client():
                     label=None
                 )
             )
-            await websocket.send_json({
+            await websocket.send(json.dumps({
                 "encrypted_secret": base64.b64encode(client_encrypted_secret).decode()
-            })
+            }))
             
             # Step 5: Derive shared secret
             shared_secret = hashlib.sha256(server_secret + client_secret).digest()

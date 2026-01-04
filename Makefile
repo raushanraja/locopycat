@@ -1,4 +1,4 @@
-.PHONY: help setup install clean run-client run-server start-server stop-server restart-server dev-server build-server docker-up docker-down docker-detached docker-logs docker-stop docker-restart docker-build
+.PHONY: help setup install clean run-client run-server start-server stop-server restart-server dev-server build-server docker-up docker-down docker-detached docker-logs docker-stop docker-restart docker-build init-keys
 
 help: ## Show this help message
 	@echo "Usage: make [target]"
@@ -50,6 +50,9 @@ run-server: ## Run the FastAPI server (requires setup)
 dev-server: ## Run the server in development mode with hot reload
 	$(MAKE) run-server
 
+init-keys: ## Initialize Docker volumes with server keys
+	@bash init_keys.sh
+
 start-server: ## Start the server in background
 	@if [ ! -d ".venv" ]; then \
 		echo "Virtual environment not found. Running setup first..."; \
@@ -64,8 +67,7 @@ start-server: ## Start the server in background
 		fi; \
 	fi
 	@echo "Starting server in background..."
-	@nohup .venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 > server.log 2>&1 & \
-		echo $$! > .server.pid
+	@nohup .venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 > server.log 2>&1 & echo $$! > .server.pid
 	@echo "Server started (PID: $(cat .server.pid))"
 	@echo "Logs: server.log"
 	@echo "To stop: make stop-server"

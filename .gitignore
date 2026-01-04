@@ -7,6 +7,13 @@ ENV/
 server.log
 .server.pid
 
+# Environment variables
+.env
+.env.local
+
+# Docker data and keys
+data/
+
 # Security - Keys and certificates
 server_private.pem
 server_public.pem

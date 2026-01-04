@@ -8,8 +8,14 @@ import os
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 import hashlib
+import base64
+from dotenv import load_dotenv
 
-AUTHORIZED_CLIENTS_FILE = "authorized_clients.txt"
+# Load environment variables
+load_dotenv()
+
+# Configuration from environment variables with defaults
+AUTHORIZED_CLIENTS_FILE = os.getenv("AUTHORIZED_CLIENTS_FILE", "authorized_clients.txt")
 CLIENT_KEYS_DIR = ".keys"
 
 
@@ -18,12 +24,28 @@ def load_authorized_clients():
     authorized_keys = {}
     if os.path.exists(AUTHORIZED_CLIENTS_FILE):
         with open(AUTHORIZED_CLIENTS_FILE, 'r') as f:
-            for line in f:
+            content = f.read().strip()
+            for line in content.split('\n'):
                 line = line.strip()
-                if line and not line.startswith('#'):
+                if not line or line.startswith('#'):
+                    continue
+                # Check if this is the new format (base64)
+                if '::' in line:
+                    parts = line.split('::', 1)
+                    if len(parts) == 2:
+                        client_id, encoded_key = parts
+                        try:
+                            public_key_pem = base64.b64decode(encoded_key).decode()
+                            authorized_keys[client_id] = public_key_pem
+                        except Exception as e:
+                            print(f"Warning: Failed to decode key for {client_id}: {e}")
+                # Old format (single line without base64)
+                elif ':' in line:
                     parts = line.split(':', 1)
                     if len(parts) == 2:
                         client_id, public_key_pem = parts
+                        # Replace literal \n with actual newlines
+                        public_key_pem = public_key_pem.replace('\\n', '\n')
                         authorized_keys[client_id] = public_key_pem
     return authorized_keys
 
@@ -32,7 +54,9 @@ def save_authorized_clients(authorized_keys):
     """Save authorized client public keys to file."""
     with open(AUTHORIZED_CLIENTS_FILE, 'w') as f:
         for client_id, public_key_pem in authorized_keys.items():
-            f.write(f"{client_id}:{public_key_pem}\n")
+            # Use base64 encoding to handle multi-line keys
+            encoded_key = base64.b64encode(public_key_pem.encode()).decode()
+            f.write(f"{client_id}::{encoded_key}\n")
 
 
 def get_key_fingerprint(public_key_pem):
