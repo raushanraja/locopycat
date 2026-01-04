@@ -2,12 +2,22 @@
 
 A FastAPI server with WebSocket support that broadcasts received text to connected clients for clipboard operations.
 
+## Features
+
+- **Secure authentication** using RSA public/private key exchange
+- **Encrypted communication** with HMAC verification
+- **Automatic key generation** on first run
+- **Multiple client support** - unlimited clients can connect
+- **Auto-reconnect** with exponential backoff
+- **Docker support** - run server in container
+- **Easy CLI** via Makefile
+
 ## Architecture
 
 ```
 ┌─────────────┐         WebSocket          ┌─────────────┐
-│   Server    │ ◄───────────────────────► │   Client    │
-│ (in Docker) │                            │   (Local)   │
+│   Server    │ ◄───────────────────────►  │   Client    │
+│ (in Docker) │   (Auth + Encrypted)       │   (Local)   │
 │   :8000     │                            │   clipboard │
 └─────────────┘                            └─────────────┘
      ▲                                        ▲
@@ -15,6 +25,15 @@ A FastAPI server with WebSocket support that broadcasts received text to connect
   HTTP/POST                            Local machine
 /print, /api/print
 ```
+
+### Authentication Flow
+
+1. **Key Exchange**: Client and server exchange RSA public keys
+2. **Secret Exchange**: Both parties exchange encrypted random secrets
+3. **Shared Secret**: Derive shared secret using SHA256
+4. **Secure Communication**: All messages encrypted with shared secret
+
+See [AUTH.md](AUTH.md) for detailed authentication documentation.
 
 ## Setup
 
@@ -120,11 +139,14 @@ The exposed port is 8000. Make sure your Docker setup allows external access:
 - fastapi
 - uvicorn
 - websockets
+- cryptography (>=41.0.0)
 
 ### Client
 - Python 3.7+
 - websockets
 - pyperclip
+- cryptography (>=41.0.0)
+- tenacity (>=8.2.0)
 - On Linux: xclip or xsel (install via package manager)
 
 Install xclip on Linux:
@@ -133,6 +155,47 @@ sudo apt-get install xclip  # Debian/Ubuntu
 sudo dnf install xclip      # Fedora
 sudo pacman -S xclip        # Arch Linux
 ```
+
+## Client Authorization
+
+**Important:** Only authorized clients can connect and receive clipboard data. Unauthorized connections are rejected.
+
+### Managing Authorized Clients
+
+Use the `manage_clients.py` script on the server:
+
+```bash
+# List all authorized clients
+python manage_clients.py list
+
+# Add a new client (from client's public key)
+python manage_clients.py add .keys/client_public.pem my-laptop
+
+# Remove a client
+python manage_clients.py remove my-laptop
+
+# Export a client's public key for distribution
+python manage_clients.py export my-laptop my-laptop-key.pem
+```
+
+### Authorization Steps (First Time)
+
+1. **Start the client once** - This generates its key pair (`.keys/client_public.pem` and `.keys/client_private.pem`)
+2. **Export the public key** - Copy `.keys/client_public.pem` to the server
+3. **Authorize the client** - On the server, run:
+   ```bash
+   python manage_clients.py add path/to/client_public.pem my-client-name
+   ```
+4. **Restart the client** - Now it can connect securely
+
+### Viewing Authorization Status
+
+When a client attempts to connect:
+
+- **Authorized**: `Authorized client attempting connection: abc123...` → Success
+- **Unauthorized**: `Connection rejected: Unauthorized client (fingerprint: abc123...)` → Rejected
+
+The server will show instructions for authorizing the rejected client.
 
 ## Example Workflow
 
