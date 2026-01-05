@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 WebSocket client for locopycat server.
-Connects to the server and copies received text to the local clipboard.
+Connects to the server and copies received text/images to the local clipboard.
 """
 
 import asyncio
@@ -13,6 +13,8 @@ import os
 import secrets
 import hashlib
 import base64
+import subprocess
+import datetime
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -24,6 +26,12 @@ import logging
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.backends import default_backend
+try:
+    import io
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
 
 # Configure logging for retry attempts
 logging.basicConfig(level=logging.INFO)
@@ -40,10 +48,53 @@ MAX_WAIT = 60     # Maximum wait time in seconds
 # Keys directory
 KEYS_DIR = ".keys"
 
+# Image save directory configuration
+# Can be overridden via environment variable LOCOPYCAT_IMAGE_DIR
+IMAGE_SAVE_DIR = os.getenv("LOCOPYCAT_IMAGE_DIR", "received_images")
+
+# Whether to save images to disk (even when clipboard copy succeeds)
+SAVE_IMAGES = os.getenv("LOCOPYCAT_SAVE_IMAGES", "true").lower() == "true"
+
 
 def cycle_key(key: bytes, length: int) -> bytes:
     """Cycle the key to match required length."""
     return (key * ((length // len(key)) + 1))[:length]
+
+
+def setup_image_dir():
+    """Create the image save directory if it doesn't exist."""
+    if not os.path.exists(IMAGE_SAVE_DIR):
+        os.makedirs(IMAGE_SAVE_DIR)
+        print(f"Created image save directory: {IMAGE_SAVE_DIR}")
+
+
+def save_image(image_data: bytes, mime_type: str = "image/png") -> str:
+    """Save image data to disk and return the file path."""
+    setup_image_dir()
+    
+    # Determine file extension from MIME type
+    mime_to_ext = {
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/gif": ".gif",
+        "image/webp": ".webp",
+        "image/bmp": ".bmp"
+    }
+    
+    ext = mime_to_ext.get(mime_type.lower(), ".png")
+    
+    # Generate filename with timestamp
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # Remove last digit for millisecond precision
+    filename = f"image_{timestamp}{ext}"
+    filepath = os.path.join(IMAGE_SAVE_DIR, filename)
+    
+    # Write image data
+    with open(filepath, "wb") as f:
+        f.write(image_data)
+    
+    print(f"   Image saved to: {filepath}")
+    return filepath
 
 
 def generate_client_keys():
@@ -105,7 +156,8 @@ def generate_client_keys():
 )
 async def connect_with_retry():
     """Connect to WebSocket server with exponential backoff retry."""
-    return await websockets.connect(SERVER_URL)
+    # Increase max_size to 50MB (52428800 bytes) to handle large images
+    return await websockets.connect(SERVER_URL, max_size=52428800)
 
 
 async def decrypt_message(encrypted_payload: dict, shared_secret: bytes) -> dict:
@@ -149,18 +201,142 @@ async def handle_messages(websocket, shared_secret):
                 data = payload
             
             if data.get("action") == "copy":
+                content_type = data.get("type", "text")
                 content = data.get("content", "")
-                print(f"Received content ({len(content)} chars)")
-                print(f"   Content: {content[:50]}{'...' if len(content) > 50 else ''}")
                 
-                try:
-                    pyperclip.copy(content)
-                    print("Copied to clipboard!\n")
-                except Exception as e:
-                    print(f"Failed to copy to clipboard: {e}\n")
-                    print(f"   Tip: On Linux, ensure xclip or xsel is installed")
-                    print(f"        sudo apt-get install xclip  # Debian/Ubuntu")
-                    print(f"        sudo dnf install xclip     # Fedora\n")
+                if content_type == "image":
+                    print(f"Received image ({len(content)} bytes base64 encoded)")
+                    mime_type = data.get("mime_type", "image/png")
+                    print(f"   MIME Type: {mime_type}")
+                    
+                    try:
+                        # Decode base64
+                        image_data = base64.b64decode(content)
+                        print(f"   Decoded size: {len(image_data)} bytes")
+                        
+                        # Save image to disk (if enabled)
+                        if SAVE_IMAGES:
+                            saved_path = save_image(image_data, mime_type)
+                        else:
+                            saved_path = None
+                        
+                        if PIL_AVAILABLE:
+                            img = Image.open(io.BytesIO(image_data))
+                            
+                            if sys.platform == 'darwin':
+                                # macOS - use osascript to copy image
+                                import tempfile
+                                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                                    tmp_path = tmp.name
+                                    if img.mode in ('RGBA', 'LA', 'P'):
+                                        img = img.convert('RGBA') if img.mode != 'RGBA' else img.convert('RGB')
+                                    if img.mode == 'RGBA':
+                                        # Create white background
+                                        background = Image.new('RGBA', img.size, (255, 255, 255, 255))
+                                        background.paste(img, mask=img.split()[3])
+                                        img = background
+                                    img.save(tmp_path, format='PNG')
+                                
+                                os.system(f'osascript -e \'set the clipboard to (read file "POSIX file://{tmp_path}" as «class PNGf»)\'')
+                                os.unlink(tmp_path)
+                                print("Image copied to clipboard!\n")
+                                
+                            elif sys.platform == 'win32':
+                                # Windows - use PyWin32 if available, otherwise try clipboard
+                                try:
+                                    import win32clipboard
+                                    import tempfile
+                                    
+                                    with tempfile.NamedTemporaryFile(suffix='.dib', delete=False) as tmp:
+                                        tmp_path = tmp.name
+                                        # Convert to DIB format for Windows clipboard
+                                        output = io.BytesIO()
+                                        if img.mode != 'RGB':
+                                            img = img.convert('RGB')
+                                        img.save(output, format='BMP')
+                                        # Remove BMP header (14 bytes) to get DIB
+                                        dib_data = output.getvalue()[14:]
+                                        tmp.write(dib_data)
+                                        tmp.close()
+                                    
+                                    win32clipboard.OpenClipboard()
+                                    win32clipboard.EmptyClipboard()
+                                    win32clipboard.SetClipboardData(win32clipboard.CF_DIB, dib_data)
+                                    win32clipboard.CloseClipboard()
+                                    os.unlink(tmp_path)
+                                    print("Image copied to clipboard!\n")
+                                except ImportError:
+                                    # PyWin32 not available, try alternative
+                                    import tempfile
+                                    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                                        tmp_path = tmp.name
+                                        img.save(tmp_path, format='PNG')
+                                    subprocess.Popen(['powershell', '-Command', f'Set-Clipboard -Path "{tmp_path}"'], shell=True)
+                                    print("Image copied to clipboard! (via PowerShell)\n")
+                                except Exception as e:
+                                    print(f"Failed to copy image on Windows: {e}")
+                                    raise
+                                    
+                            elif sys.platform.startswith('linux'):
+                                # Linux - try xclip with image support
+                                import tempfile
+                                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                                    tmp_path = tmp.name
+                                    img.save(tmp_path, format='PNG')
+                                
+                                # Try xclip with image support
+                                try:
+                                    # Run xclip in the background - it may stay alive to maintain clipboard
+                                    subprocess.Popen(
+                                        ['xclip', '-selection', 'clipboard', '-t', 'image/png', '-i', tmp_path],
+                                        stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL
+                                    )
+                                    print("Image copied to clipboard!\n")
+                                except FileNotFoundError:
+                                    print("Note: Image clipboard support requires xclip")
+                                    print(f"Image saved to: {tmp_path}")
+                                    print("Install xclip: sudo apt-get install xclip\n")
+                                except Exception as e:
+                                    print(f"Note: Failed to copy image to clipboard: {e}")
+                                    print(f"Image saved to: {tmp_path}\n")
+                                finally:
+                                    # Clean up temp file after a short delay
+                                    import threading
+                                    def cleanup_tmp():
+                                        import time
+                                        time.sleep(0.5)  # Give xclip time to read the file
+                                        try:
+                                            os.unlink(tmp_path)
+                                        except:
+                                            pass
+                                    threading.Thread(target=cleanup_tmp, daemon=True).start()
+                            else:
+                                print(f"Platform {sys.platform} not supported for image clipboard")
+                        else:
+                            # PIL not installed - print error
+                            if not saved_path:
+                                print("Note: PIL/Pillow not installed. Install it for image clipboard support:")
+                                print("      pip install pillow")
+                                print("")
+                                
+                    except Exception as e:
+                        print(f"Failed to copy image to clipboard: {e}\n")
+                        import traceback
+                        traceback.print_exc()
+                else:
+                    # Text content
+                    print(f"Received content ({len(content)} chars)")
+                    print(f"   Content: {content[:50]}{'...' if len(content) > 50 else ''}")
+                    
+                    try:
+                        pyperclip.copy(content)
+                        print("Copied to clipboard!\n")
+                    except Exception as e:
+                        print(f"Failed to copy to clipboard: {e}\n")
+                        print(f"   Tip: On Linux, ensure xclip or xsel is installed")
+                        print(f"        sudo apt-get install xclip  # Debian/Ubuntu")
+                        print(f"        sudo dnf install xclip     # Fedora\n")
         
         except websockets.exceptions.ConnectionClosed:
             raise  # Re-raise to trigger reconnection
@@ -172,6 +348,9 @@ async def clipboard_client():
     """Connect to WebSocket server and handle clipboard operations with auto-reconnect."""
     retry_count = 0
     max_reconnect_attempts = -1  # -1 means infinite reconnection attempts
+    
+    # Setup image save directory
+    setup_image_dir()
     
     # Generate client keys
     client_private_key, client_public_key = generate_client_keys()

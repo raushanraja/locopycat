@@ -6,11 +6,13 @@ A FastAPI server with WebSocket support that broadcasts received text to connect
 
 - **Secure authentication** using RSA public/private key exchange
 - **Encrypted communication** with HMAC verification
+- **Text & Image support** - send text or images to client clipboard
 - **Automatic key generation** on first run
 - **Multiple client support** - unlimited clients can connect
 - **Auto-reconnect** with exponential backoff
 - **Docker support** - run server in container
 - **Easy CLI** via Makefile
+- **Web interface** - drag & drop images or paste text directly
 
 ## Architecture
 
@@ -100,19 +102,36 @@ curl -X POST http://localhost:8000/api/print \
   -d '{"content": "Hello, clipboard!"}'
 ```
 
-### Send text via HTML form
-Visit `http://localhost:8000/` in your browser and paste text in the form.
+### Send image via API
+```bash
+# First encode your image to base64
+base64 -w 0 image.png > image.txt
+
+# Then send it
+curl -X POST http://localhost:8000/api/print \
+  -H "Content-Type: application/json" \
+  -d '{
+    "content": "'"$(cat image.txt)"'",
+    "type": "image",
+    "mime_type": "image/png"
+  }'
+```
+
+### Send text/image via HTML form
+Visit `http://localhost:8000/` in your browser and:
+- Use the **Text** tab to paste text
+- Use the **Image** tab to drag & drop an image or upload a file
 
 ### Test with WebSocket
 ```bash
 # Using websocat or wscat
 wscat -c ws://localhost:8000/ws
-# You'll receive messages when text is sent to /print or /api/print
+# You'll receive messages when text/images are sent to /print or /api/print
 ```
 
 ## Multiple Clients
 
-You can run multiple clients simultaneously. All connected clients will receive and copy the text to their local clipboards.
+You can run multiple clients simultaneously. All connected clients will receive and copy the text/images to their local clipboards.
 
 ```bash
 # Terminal 1
@@ -133,13 +152,42 @@ The exposed port is 8000. Make sure your Docker setup allows external access:
 - For remote servers, use the server's IP address instead of `localhost`
 - Example: `SERVER_URL = "ws://192.168.1.100:8000/ws"`
 
+## Image Clipboard Support
+
+The client supports sending and receiving images to the clipboard:
+
+- **Server**: Accepts images via drag & drop on the web interface or API
+- **Client**: Automatically copies received images to the clipboard AND saves them to disk
+
+### Image Save Directory
+
+All received images are automatically saved to the `received_images/` directory (by default). You can customize this:
+
+```bash
+# Set a custom directory via environment variable
+export LOCOPYCAT_IMAGE_DIR="/path/to/images"
+
+# Disable saving images (only copy to clipboard)
+export LOCOPYCAT_SAVE_IMAGES="false"
+```
+
+**Filename format:** `image_YYYYMMDD_HHMMSS_mmm.jpg/png/gif`
+
+**Platform Notes:**
+- **macOS**: Full support for image copying using osascript
+- **Windows**: Full support using clipboard with DIB format
+- **Linux**: Uses xclip for clipboard (requires X11)
+
 ## Requirements
 
 ### Server
+- Python 3.7+
 - fastapi
 - uvicorn
 - websockets
 - cryptography (>=41.0.0)
+- python-dotenv
+- pillow (for optional image processing)
 
 ### Client
 - Python 3.7+
@@ -147,6 +195,7 @@ The exposed port is 8000. Make sure your Docker setup allows external access:
 - pyperclip
 - cryptography (>=41.0.0)
 - tenacity (>=8.2.0)
+- pillow (>=10.0.0, for image clipboard support)
 - On Linux: xclip or xsel (install via package manager)
 
 Install xclip on Linux:

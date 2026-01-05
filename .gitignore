@@ -14,6 +14,9 @@ server.log
 # Docker data and keys
 data/
 
+# Image save directory
+received_images/
+
 # Security - Keys and certificates
 server_private.pem
 server_public.pem
