@@ -1,0 +1,24 @@
+[Unit]
+Description=Locopycat Client Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=%h/locopycat
+# Adjust the path to your Python interpreter if needed
+ExecStart=/usr/bin/python3 %h/locopycat/client.py
+# Restart automatically if the client crashes
+Restart=always
+RestartSec=10
+# Ensure we have DISPLAY variable for clipboard access
+Environment=DISPLAY=:0
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=locopycat-client
+
+[Install]
+WantedBy=default.target
