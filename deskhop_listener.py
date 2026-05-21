@@ -3,13 +3,12 @@
 DeskHop-to-LoCopyCat clipboard bridge.
 
 Monitors the DeskHop KVM switch keyboard HID interface for Ctrl+C/X
-presses, reads the local clipboard content, and pushes it to the
-locopycat server API for broadcasting to connected clients.
+presses AND polls the local clipboard for changes. When new content
+is detected, pushes it to the locopycat server API for broadcasting
+to connected clients.
 
-This works with the stock DeskHop firmware (CFG_TUD_HID=2) which does
-not expose a separate vendor HID interface.  Instead of waiting for a
-firmware clipboard signal, we detect the actual keyboard shortcut and
-react immediately.
+Works with the stock DeskHop firmware (CFG_TUD_HID=2) which does not
+expose a separate vendor HID interface.
 
 Requires:
   - pyperclip (with xclip/xsel on Linux, or wl-clipboard on Wayland)
@@ -37,17 +36,18 @@ import pyperclip
 
 SERVER_URL = os.getenv("LOCOPYCAT_SERVER_URL", "http://localhost:8000").rstrip("/")
 API_ENDPOINT = f"{SERVER_URL}/api/print"
-HID_POLL_TIMEOUT = 1.0       # seconds for select() poll on HID device
-DEVICE_RETRY_INTERVAL = 5.0  # seconds between device re-discovery attempts
+CLIPBOARD_POLL_INTERVAL = float(os.getenv("LOCOPYCAT_CLIPBOARD_POLL", "0.5"))
+HID_POLL_TIMEOUT = 1.0
+DEVICE_RETRY_INTERVAL = 5.0
 
 # DeskHop USB identity
 DESKHOP_VID = 0x2e8a
 DESKHOP_PID = 0x107c
 
-# HID keyboard report indices
-RID_KEYBOARD = 1       # Keyboard report ID
-IDX_MODIFIER = 1       # Modifier byte offset
-IDX_KEYCODES = 3       # Keycode array start offset
+# HID keyboard report layout
+RID_KEYBOARD = 1
+IDX_MODIFIER = 1
+IDX_KEYCODES = 3
 KEYCODE_C = 0x06
 KEYCODE_X = 0x1B
 MOD_LCTRL = 0x01
@@ -64,7 +64,6 @@ log = logging.getLogger("deskhop-bridge")
 # ── HID device discovery ───────────────────────────────────────────────
 
 def _read_sysfs(path: str) -> Optional[str]:
-    """Read a sysfs file, return stripped content or None."""
     try:
         with open(path) as f:
             return f.read().strip()
@@ -73,7 +72,6 @@ def _read_sysfs(path: str) -> Optional[str]:
 
 
 def _is_deskhop_device(syspath: str) -> bool:
-    """Check whether a hidraw sysfs path belongs to a DeskHop device."""
     modalias = (
         _read_sysfs(f"{syspath}/device/modalias")
         or _read_sysfs(f"{syspath}/device/../modalias")
@@ -84,32 +82,20 @@ def _is_deskhop_device(syspath: str) -> bool:
 
 
 def find_keyboard_device() -> Optional[str]:
-    """
-    Find the DeskHop keyboard HID interface.
-
-    Scans /sys/class/hidraw/ for a DeskHop device whose report descriptor
-    contains the keyboard usage (Usage Page 1, Usage 6).
-    """
+    """Find the DeskHop keyboard HID interface by checking the report
+    descriptor for keyboard usage (Usage Page 1, Usage 6)."""
     for entry in sorted(os.listdir("/sys/class/hidraw/")):
         hidraw_path = f"/dev/{entry}"
         syspath = f"/sys/class/hidraw/{entry}"
-
         if not _is_deskhop_device(syspath):
             continue
-
-        # Read report descriptor from sysfs
         try:
             with open(f"{syspath}/device/report_descriptor", "rb") as f:
                 desc = f.read()
         except OSError:
             continue
-
-        # Check for keyboard usage: 0x05=Global|UsagePage|1byte, 0x01=Desktop,
-        #                           0x09=Local|Usage|1byte, 0x06=Keyboard
         if b"\x05\x01\x09\x06" in desc:
-            log.debug("Found keyboard interface at %s (%d bytes desc)", hidraw_path, len(desc))
             return hidraw_path
-
     return None
 
 
@@ -119,11 +105,8 @@ def has_ctrl_c_or_x(report: bytes) -> bool:
     """Return True if this HID keyboard report contains Ctrl+C or Ctrl+X."""
     if len(report) < IDX_KEYCODES + 6 or report[0] != RID_KEYBOARD:
         return False
-
-    # Either left or right Ctrl must be held
     if not (report[IDX_MODIFIER] & (MOD_LCTRL | MOD_RCTRL)):
         return False
-
     keycodes = report[IDX_KEYCODES:IDX_KEYCODES + 6]
     return KEYCODE_C in keycodes or KEYCODE_X in keycodes
 
@@ -158,19 +141,17 @@ def main():
     log.info("API endpoint: %s", API_ENDPOINT)
 
     last_content_hash = ""
+    last_clipboard_check = 0.0
     fd = None
     poll_obj = select.poll()
 
     try:
         while True:
-            # ── Open device if not connected ─────────────────────────
+            # ── Open HID device if not connected ──────────────────────
             if fd is None:
                 device_path = find_keyboard_device()
                 if device_path is None:
-                    log.info(
-                        "DeskHop not found, retrying in %.0fs...",
-                        DEVICE_RETRY_INTERVAL,
-                    )
+                    log.info("DeskHop not found, retrying in %.0fs...", DEVICE_RETRY_INTERVAL)
                     time.sleep(DEVICE_RETRY_INTERVAL)
                     continue
 
@@ -185,63 +166,65 @@ def main():
                     time.sleep(DEVICE_RETRY_INTERVAL)
                     continue
 
-            # ── Poll for HID reports ─────────────────────────────────
+            # ── Poll for HID reports ──────────────────────────────────
             try:
                 events = poll_obj.poll(int(HID_POLL_TIMEOUT * 1000))
             except KeyboardInterrupt:
                 raise
 
-            if not events:
-                continue
+            # ── Path 1: HID keyboard trigger (Ctrl+C/X) ──────────────
+            if events:
+                try:
+                    raw = os.read(fd, 64)
+                except OSError:
+                    log.info("Device disconnected, reconnecting...")
+                    poll_obj.unregister(fd)
+                    os.close(fd)
+                    fd = None
+                    continue
 
-            # Read raw HID report
-            try:
-                raw = os.read(fd, 64)
-            except OSError:
-                log.info("Device disconnected, reconnecting...")
-                poll_obj.unregister(fd)
-                os.close(fd)
-                fd = None
-                continue
+                if has_ctrl_c_or_x(raw):
+                    try:
+                        content = pyperclip.paste()
+                    except Exception as e:
+                        log.warning("Failed to read clipboard: %s", e)
+                        continue
 
-            # ── Debug: log non-zero keyboard reports ─────────────────
-            if raw[0] == RID_KEYBOARD and raw[1] != 0:
-                log.debug(
-                    "KBD report: mod=0x%02x keys=[%s]",
-                    raw[1],
-                    " ".join(f"0x{b:02x}" for b in raw[3:9] if b != 0),
-                )
+                    content_hash = hashlib.sha256(content.encode()).hexdigest()
+                    if content_hash == last_content_hash or not content:
+                        continue
+                    last_content_hash = content_hash
 
-            # ── Check for Ctrl+C / Ctrl+X ────────────────────────────
-            if not has_ctrl_c_or_x(raw):
-                continue
+                    log.info(
+                        "Ctrl+%s detected! Sending %d chars to API...",
+                        "X" if KEYCODE_X in raw[IDX_KEYCODES:IDX_KEYCODES + 6] else "C",
+                        len(content),
+                    )
+                    if send_to_api(content):
+                        log.info("Sent successfully")
+                    else:
+                        log.info("Send failed (will retry on next event)")
 
-            # ── Clipboard event! ─────────────────────────────────────
-            try:
-                content = pyperclip.paste()
-            except Exception as e:
-                log.warning("Failed to read clipboard: %s", e)
-                continue
+            # ── Path 2: Clipboard polling ─────────────────────────────
+            now = time.monotonic()
+            if now - last_clipboard_check >= CLIPBOARD_POLL_INTERVAL:
+                last_clipboard_check = now
+                try:
+                    content = pyperclip.paste()
+                except Exception as e:
+                    log.warning("Failed to read clipboard: %s", e)
+                    continue
 
-            # Debounce: skip duplicate content
-            content_hash = hashlib.sha256(content.encode()).hexdigest()
-            if content_hash == last_content_hash:
-                continue
-            last_content_hash = content_hash
+                content_hash = hashlib.sha256(content.encode()).hexdigest()
+                if content_hash == last_content_hash or not content:
+                    continue
+                last_content_hash = content_hash
 
-            if not content:
-                log.info("Ctrl+C/X detected but clipboard is empty, skipping")
-                continue
-
-            log.info(
-                "Ctrl+%s detected! Sending %d chars to API...",
-                "X" if KEYCODE_X in raw[IDX_KEYCODES:IDX_KEYCODES + 6] else "C",
-                len(content),
-            )
-            if send_to_api(content):
-                log.info("Sent successfully")
-            else:
-                log.info("Send failed (will retry on next event)")
+                log.info("Clipboard changed! Sending %d chars to API...", len(content))
+                if send_to_api(content):
+                    log.info("Sent successfully")
+                else:
+                    log.info("Send failed (will retry on next event)")
 
     except KeyboardInterrupt:
         log.info("Shutting down")
