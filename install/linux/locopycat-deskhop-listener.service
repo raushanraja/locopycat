@@ -1,0 +1,27 @@
+[Unit]
+Description=Locopycat DeskHop Listener Service
+Documentation=https://github.com/raushanraja/locopycat
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=%h/locopycat
+# Adjust path to Python interpreter if needed
+ExecStart=%h/locopycat/deskhop_listener.py
+# Restart if the listener crashes
+Restart=always
+RestartSec=10
+# DISPLAY needed for xclip clipboard access under X11
+Environment=DISPLAY=:0
+# Set your server URL here or use the default (http://localhost:8000)
+# Environment=LOCOPYCAT_SERVER_URL=http://localhost:8000
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=locopycat-deskhop
+
+[Install]
+WantedBy=default.target
